@@ -290,6 +290,15 @@ impl IndexService {
             stop(indexing.child, indexing.stdin, "stop");
         }
     }
+
+    pub fn skip_long_file(&self, file_id: i64) -> Result<(), String> {
+        let mut running = self.running.lock().unwrap();
+        let Some(indexing) = running.as_mut() else { return Ok(()); };
+        if !matches!(indexing.child.try_wait(), Ok(None)) {
+            return Ok(());
+        }
+        writeln!(indexing.stdin, "skip {file_id}").and_then(|_| indexing.stdin.flush()).map_err(|e| e.to_string())
+    }
 }
 
 /// `digup download-model`: the model files, from the Hugging Face cache or downloaded with resume, each checked. One at

@@ -35,6 +35,7 @@ nonisolated struct EngineStatus: Sendable, Equatable {
     var heldUntil: Date?
     /// The helper found no model yet (it's downloading): files are found and named, nothing gets embedded.
     var waitingForModel = false
+    var longFile: LongFile?
     /// Chosen folders that aren't there right now (an unplugged drive): skipped, and their files kept.
     var missingRoots: [String] = []
     /// Chosen folders macOS doesn't let DigUp read (Privacy & Security → Files and Folders): skipped, files kept.
@@ -56,6 +57,14 @@ nonisolated struct EngineStatus: Sendable, Equatable {
     }
 
     struct Progress: Sendable, Equatable {
+        var done: Int
+        var total: Int
+    }
+
+    struct LongFile: Sendable, Equatable {
+        var id: Int64
+        var path: String
+        var kind: FileKind
         var done: Int
         var total: Int
     }
@@ -586,19 +595,38 @@ nonisolated final class Engine: @unchecked Sendable {
                 syncWantedAt = nil
             }
             applyCounts(event)
-            if int("new") > 0 { update { $0.activity = .indexing(done: 0, total: int("new")) } }
+            if int("new") > 0 {
+                update {
+                    $0.activity = .indexing(done: 0, total: int("new"))
+                    $0.longFile = nil
+                }
+            }
             log("sync: \(int("added")) new · \(int("changed")) changed · \(int("moved")) moved · "
                 + "\(int("removed")) removed · \(int("unchanged")) unchanged in \(int("ms")) ms")
         case "file":
             let (done, total) = (int("done"), int("total"))
-            update { $0.activity = .indexing(done: done, total: total) }
+            update {
+                $0.activity = .indexing(done: done, total: total)
+                $0.longFile = nil
+            }
             if event["new"] as? Bool == true, let path = event["path"] as? String {
                 log(String(format: "index: %@ %@ in %.2f s", (path as NSString).lastPathComponent,
                            event["state"] as? String ?? "?", event["seconds"] as? Double ?? 0))
             }
             refreshSearcher(force: false)
         case "rest":
-            update { $0.activity = .finishing(done: int("done"), total: int("total"), files: int("files")) }
+            update {
+                $0.activity = .finishing(done: int("done"), total: int("total"), files: int("files"))
+                let state = event["state"] as? String ?? ""
+                if state == "done" || state == "skipped" {
+                    $0.longFile = nil
+                } else if let path = event["path"] as? String,
+                          let kindName = event["kind"] as? String,
+                          let kind = FileKind(rawValue: kindName) {
+                    $0.longFile = .init(id: Int64(int("file")), path: path, kind: kind, done: int("done"),
+                                        total: int("total"))
+                }
+            }
             refreshSearcher(force: false)
         case "summary":
             let states = (event["states"] as? [String: Int] ?? [:]).sorted { $0.key < $1.key }
@@ -608,13 +636,17 @@ nonisolated final class Engine: @unchecked Sendable {
             log("index: \(what): \(states) in \(int("ms")) ms")
         case "idle":
             applyCounts(event)
-            update { $0.activity = .idle }
+            update {
+                $0.activity = .idle
+                $0.longFile = nil
+            }
             refreshSearcher(force: true)
         case "waiting":
             applyCounts(event)
             update {
                 $0.activity = .idle
                 $0.waitingForModel = true
+                $0.longFile = nil
             }
             log("indexer: waiting for the model to download")
         case "missing":
@@ -636,7 +668,12 @@ nonisolated final class Engine: @unchecked Sendable {
             log("indexer: the model or settings changed, indexing everything again (was: \(event["from"] as? String ?? "?"))")
         case "error":
             log("indexer: \(event["message"] as? String ?? "error")")
-            if event["fatal"] as? Bool == true { update { $0.activity = .failed("Indexing stopped") } }
+            if event["fatal"] as? Bool == true {
+                update {
+                    $0.activity = .failed("Indexing stopped")
+                    $0.longFile = nil
+                }
+            }
         default:
             break
         }
@@ -713,6 +750,7 @@ nonisolated final class Engine: @unchecked Sendable {
             if case .finishing = $0.activity { $0.activity = .idle }
             if case .starting = $0.activity { $0.activity = .idle }
             $0.code.indexing = nil
+            $0.longFile = nil
         }
         refreshSearcher(force: true)
         refreshCodeSearcher(force: true)
@@ -765,6 +803,13 @@ nonisolated final class Engine: @unchecked Sendable {
         log(paused ? "indexing paused" : "indexing resumed")
         indexQueue.async { [self] in
             if paused { stopHelper() } else { startHelper() }
+        }
+
+        /// Stops finishing this long file after its current step.
+        func skipLongFile(_ id: Int64) {
+            indexQueue.async { [self] in
+                send("skip \(id)")
+            }
         }
     }
 

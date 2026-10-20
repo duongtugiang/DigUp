@@ -134,18 +134,37 @@ $("change-shortcut").onclick = () => {
 /// How indexing goes: the status line, a bar while something's under way, the counts, and Pause or Resume.
 function renderStatus() {
   const state = info.state || {};
-  $("status-line").textContent = state.line || "";
+  const longFile = state.longFile || null;
+  $("status-line").textContent = longFile ? `Reading long file “${nameOf(longFile.path)}”` : state.line || "";
+  $("status-line").title = longFile ? shown(longFile.path) : "";
+  $("status-line").setAttribute("aria-label", longFile ? `Reading long file ${shown(longFile.path)}` : (state.line || ""));
   $("status-bar").hidden = state.progress == null;
   $("status-fill").style.width = `${Math.round(100 * (state.progress || 0))}%`;
   const parts = [`${(state.searchable || 0).toLocaleString()} of ${(state.files || 0).toLocaleString()} files searchable`];
   if (state.pending) parts.push(`${state.pending.toLocaleString()} waiting`);
   if (state.unfinished) parts.push(`${state.unfinished.toLocaleString()} long ${state.unfinished === 1 ? "file" : "files"} to finish`);
   $("status-detail").textContent = parts.join(" · ");
+  $("skip-long-file").hidden = !longFile;
+  $("skip-long-file").disabled = false;
+  $("skip-long-file").title = longFile ? shown(longFile.path) : "";
+  $("skip-long-file").setAttribute("aria-label", longFile ? `Skip long file ${shown(longFile.path)}` : "Skip this file");
   $("pause").hidden = !info.folders?.length;
   $("pause").textContent = state.paused ? "Resume" : "Pause";
 }
 
 $("pause").onclick = () => invoke("pause_indexing", { paused: !(info.state || {}).paused }).catch(fail);
+$("skip-long-file").onclick = async () => {
+  const longFile = info.state?.longFile;
+  if (!longFile || longFile.fileId == null) return;
+  $("skip-long-file").disabled = true;
+  try {
+    await invoke("skip_long_file", { file_id: longFile.fileId });
+  } catch (error) {
+    fail(error);
+  } finally {
+    $("skip-long-file").disabled = false;
+  }
+};
 
 async function loadSummaries() {
   try {

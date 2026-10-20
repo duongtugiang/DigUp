@@ -264,7 +264,11 @@ private struct FolderSettings: View {
     var body: some View {
         Form {
             Section {
-                IndexProgress(model: state.model) { state.app.engine.setPaused(!state.model.status.paused) }
+                IndexProgress(model: state.model,
+                              togglePause: { state.app.engine.setPaused(!state.model.status.paused) },
+                              skipLongFile: { if let longFile = state.model.status.longFile {
+                                  state.app.engine.skipLongFile(longFile.id)
+                              } })
             }
             Section {
                 if let summaries = state.summaries {
@@ -429,11 +433,15 @@ private struct TypeExclusions: View {
 private struct IndexProgress: View {
     let model: AppModel
     let togglePause: () -> Void
+    let skipLongFile: () -> Void
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(model.statusLine).font(.system(size: 13, weight: .semibold))
+                Text(model.statusLine)
+                    .font(.system(size: 13, weight: .semibold))
+                    .help(model.status.longFile?.path ?? "")
+                    .accessibilityLabel(model.status.longFile.map { "Reading long file \($0.path)" } ?? model.statusLine)
                 if let progress = model.progress {
                     ProgressView(value: progress).controlSize(.small)
                 }
@@ -442,6 +450,10 @@ private struct IndexProgress: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if model.status.longFile != nil {
+                Button("Skip this file", action: skipLongFile)
+                    .help(model.status.longFile?.path ?? "")
+            }
             if model.hasFolders {
                 Button(model.status.paused ? "Resume" : "Pause", action: togglePause)
             }
