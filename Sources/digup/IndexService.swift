@@ -11,7 +11,7 @@ import WinSDK
 /// screenshots, and stayed there), and all of it goes back to the system when this process exits.
 ///
 /// Protocol: one command per line on stdin, one JSON event per line on stdout.
-///   stdin:  sync | sync code | stop | backfill on | backfill off      (EOF = stop)
+///   stdin:  sync | sync code | stop | backfill on | backfill off | skip <file-id>      (EOF = stop)
 ///   stdout: {"event": "missing" | "pruned" | "sync" | "file" | "rest" | "summary" | "waiting" | "idle" | "error" |
 ///            "exit", ...}; events about the code index say "code": true
 ///
@@ -54,6 +54,8 @@ final class IndexService: @unchecked Sendable {
     private var codeSyncRequested = true
     private var stopRequested = false
     private var backfillAllowed: Bool
+    /// Long files to stop after their current step; consumed when the file is skipped.
+    private var skipLongFiles = Set<Int64>()
     /// A sync asked for while files are being indexed waits until then. A crawl of a big folder can take minutes, and
     /// a folder that keeps changing asks for the next one meanwhile: yielding at once, every pass went back to crawling
     /// before a single file was read. Indexing gets at least as long as the sync before it (2 s at the least).
@@ -267,9 +269,12 @@ final class IndexService: @unchecked Sendable {
                     stopRequested || !backfillAllowed
                         || Date() >= yieldAt && (syncRequested || codeSyncRequested && code != nil)
                 }
+            }, shouldSkip: { [self] file in
+                lock.withLock { skipLongFiles.remove(file.id) != nil }
             }, onStep: { step in
-                emit(["event": "rest", "done": step.done, "total": step.total, "files": step.files, "path": step.path,
-                      "kind": step.kind.rawValue, "state": step.state, "seconds": step.seconds, "note": step.note ?? ""])
+                emit(["event": "rest", "done": step.done, "total": step.total, "files": step.files, "file": step.fileID,
+                      "path": step.path, "kind": step.kind.rawValue, "state": step.state, "seconds": step.seconds,
+                      "note": step.note ?? ""])
             })
             if !states.isEmpty {
                 emit(["event": "summary", "rest": true, "states": states,
@@ -308,6 +313,10 @@ final class IndexService: @unchecked Sendable {
                 case "stop": stopRequested = true
                 case "backfill on": backfillAllowed = true
                 case "backfill off": backfillAllowed = false
+                case let command where command.hasPrefix("skip "):
+                    if let id = Int64(command.dropFirst(5).trimmingCharacters(in: .whitespaces)) {
+                        skipLongFiles.insert(id)
+                    }
                 default: break
                 }
             }

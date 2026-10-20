@@ -43,6 +43,13 @@ import Testing
         return result
     }
 
+    func fileID(_ store: IndexStore, _ path: String) throws -> Int64 {
+        var id: Int64?
+        try store.db.query("SELECT id FROM files WHERE path = ?", [.text(path)]) { id = $0.int(0) }
+        #expect(id != nil)
+        return id ?? 0
+    }
+
     /// Where keyword search finds `word`: the page or chunk numbers.
     func found(_ store: IndexStore, _ word: String) throws -> [Int] {
         var out: [Int] = []
@@ -70,6 +77,8 @@ import Testing
         #expect(steps.map(\.total) == [90, 90, 90])
         #expect(steps.map(\.state) == ["partial", "partial", "done"])
         #expect(steps.map(\.files) == [1, 1, 0])
+        #expect(steps.map(\.fileID) == Array(repeating: try fileID(store, pdf.path), count: 3))
+        #expect(steps.map(\.path) == Array(repeating: pdf.path, count: 3))
         #expect(try places(store, pdf.path) == Array(1...120))
         #expect(try found(store, "quokka") == [100])
         let (done, info) = try state(store, pdf.path)
@@ -136,6 +145,46 @@ import Testing
         let places = try found(store, "axolotl")   // in one chunk, or two where they overlap
         #expect(!places.isEmpty && places.allSatisfy { $0 > 40 })
         #expect(try state(store, url.path).state == "done")
+    }
+
+    @Test func skippingALongFileKeepsOthersGoingAndCanRequeueOnChange() throws {
+        let firstWord = "narwhal"
+        let secondWord = "pangolin"
+        let first = prose(characters: 150_000, special: (at: 125_000, word: firstWord))
+        let second = prose(characters: 145_000, special: (at: 118_000, word: secondWord))
+        try FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+        let firstURL = files.appendingPathComponent("Team notes 2026.md")
+        let secondURL = files.appendingPathComponent("Operations digest.md")
+        try first.write(to: firstURL, atomically: false, encoding: .utf8)
+        try second.write(to: secondURL, atomically: false, encoding: .utf8)
+        let store = try store()
+        let indexer = try indexer(store, FakeEmbedder())
+        _ = try indexer.sync([files])
+        #expect(try indexer.run()["partial"] == 2)
+
+        let firstID = try fileID(store, firstURL.path)
+        var steps: [Indexer.Step] = []
+        let states = try indexer.finishLongFiles(shouldSkip: { $0.id == firstID }, onStep: { steps.append($0) })
+        #expect(states["skipped"] == 1)
+        #expect(states["done"] == 1)
+        #expect(steps.contains(where: { $0.fileID == firstID && $0.state == "skipped" && $0.path == firstURL.path }))
+        #expect(try state(store, firstURL.path).state == "skipped")
+        #expect(try state(store, secondURL.path).state == "done")
+        #expect(try places(store, firstURL.path).count == 40)   // first pass stays searchable
+        let secondPlaces = try found(store, secondWord)
+        #expect(!secondPlaces.isEmpty && secondPlaces.allSatisfy { $0 > 40 })
+        #expect(try indexer.finishLongFiles().isEmpty)   // skipped files are not retried at once
+
+        let changedWord = "wombat"
+        try prose(characters: 170_000, special: (at: 130_000, word: changedWord))
+            .write(to: firstURL, atomically: false, encoding: .utf8)
+        #expect(try indexer.sync([files]).changed == 1)
+        #expect(try state(store, firstURL.path).state == "pending")
+        try indexer.run()
+        try indexer.finishLongFiles()
+        #expect(try state(store, firstURL.path).state == "done")
+        let changedPlaces = try found(store, changedWord)
+        #expect(!changedPlaces.isEmpty && changedPlaces.allSatisfy { $0 > 40 })
     }
 
     @Test func digitsGetKeywordSearchOnly() throws {

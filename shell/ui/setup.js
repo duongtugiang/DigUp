@@ -500,20 +500,26 @@ function renderProgress() {
     note = "You can search right away: results fill in as DigUp reads your files, newest first.";
   } else if (state.activity === "finishing" && progress.rest) {
     const { done: count, total, files } = progress.rest;
-    label = `Reading the rest of ${files.toLocaleString()} long ${files === 1 ? "file" : "files"}`;
+    const longFile = state.longFile || null;
+    label = longFile ? `Reading long file “${nameOf(longFile.path)}”`
+    : `Reading the rest of ${files.toLocaleString()} long ${files === 1 ? "file" : "files"}`;
     fraction = total ? count / total : 0;
     const later = selectionPart().later, pace = progress.pace || 1;
     time = `${Math.floor(fraction * 100)}%` + (later > 0 ? ` · ${leftText(later * (1 - fraction) * pace)}` : "");
     note = "Everything is searchable; long PDFs and documents are being read past their first pages.";
-  } else if (state.activity === "idle" || (state.activity === "starting" && state.searchable > 0 && !state.pending)) {
+    what.title = longFile ? shown(longFile.path) : "";
+  } else {
+    what.title = "";
+    if (state.activity === "idle" || (state.activity === "starting" && state.searchable > 0 && !state.pending)) {
     label = state.searchable ? `${state.searchable.toLocaleString()} ${state.searchable === 1 ? "file" : "files"} indexed` : "Up to date";
     done = true;
     note = "Search from the window, or press the shortcut in any app.";
-  } else if (state.activity === "failed") {
+    } else if (state.activity === "failed") {
     label = state.line || "Indexing stopped";
-  } else {
+    } else {
     label = "Looking at your folders";
     busy = true;
+    }
   }
   what.textContent = label;
   left.textContent = time;

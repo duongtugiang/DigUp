@@ -33,6 +33,9 @@ final class AppModel {
             return "Indexing \(percent)% · \(done.formatted()) of \(total.formatted())"
         case .finishing(let done, let total, let files):
             let percent = total > 0 ? Int((Double(done) / Double(total) * 100).rounded(.down)) : 0
+            if let longFile = status.longFile {
+                return "Reading long file “\((longFile.path as NSString).lastPathComponent)” · \(percent)%"
+            }
             let which = files > 0 ? "\(files.formatted()) long \(files == 1 ? "file" : "files")" : "long files"
             return "Reading the rest of \(which) · \(percent)%"
         case .idle:

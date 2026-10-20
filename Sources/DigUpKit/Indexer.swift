@@ -163,9 +163,10 @@ public final class Indexer {
         public let done: Int
         public let total: Int
         public let files: Int        // long files not finished yet, this one included until its last step
+        public let fileID: Int64
         public let path: String
         public let kind: FileKind
-        public let state: String     // "partial" until the file's last step, then "done"
+        public let state: String     // "partial" until the file's last step, then "done" or "skipped"
         public let seconds: Double
         public let note: String?
     }
@@ -175,8 +176,8 @@ public final class Indexer {
     /// first) loses nothing, and the next pass goes on from there. It runs once nothing is pending: a book's last
     /// pages matter less than everything else's first ones, and they take a while (0.04–0.2 s a page, 2026-10-09).
     @discardableResult
-    public func finishLongFiles(shouldStop: () -> Bool = { false }, onStep: (Step) -> Void = { _ in }) throws
-        -> [String: Int] {
+    public func finishLongFiles(shouldStop: () -> Bool = { false }, shouldSkip: (FileRecord) -> Bool = { _ in false },
+                                onStep: (Step) -> Void = { _ in }) throws -> [String: Int] {
         var jobs: [Job] = []
         for file in try store.unfinished() {
             let info = try store.info(of: file.id)
@@ -203,11 +204,22 @@ public final class Indexer {
                 states[state, default: 0] += 1
                 files -= 1
             }
-            onStep(Step(done: through[index], total: through.last ?? 0, files: files, path: file.path, kind: file.kind,
-                        state: state, seconds: seconds, note: note))
-        } skip: { job in
-            // Finished sooner than its steps said: a document whose length was guessed, or a file that went unreadable.
-            finished.contains(job.files[0].id)
+            onStep(Step(done: through[index], total: through.last ?? 0, files: files, fileID: file.id, path: file.path,
+                        kind: file.kind, state: state, seconds: seconds, note: note))
+        } skip: { index, job in
+            let file = job.files[0]
+            guard !finished.contains(file.id), shouldSkip(file) else {
+                // Finished sooner than its steps said: a document whose length was guessed, or a file that went unreadable.
+                return finished.contains(file.id)
+            }
+            let info = try store.info(of: file.id)
+            try store.finish(file.id, state: "skipped", detail: "Skipped by user", info: info)
+            states["skipped", default: 0] += 1
+            finished.insert(file.id)
+            files -= 1
+            onStep(Step(done: through[index], total: through.last ?? 0, files: files, fileID: file.id, path: file.path,
+                        kind: file.kind, state: "skipped", seconds: 0, note: "Skipped by user"))
+            return true
         }
         return states
     }
@@ -220,7 +232,7 @@ public final class Indexer {
     /// screenshot, about as long as embedding it.
     private func process(_ jobs: [Job], shouldStop: () -> Bool,
                          committed: (Int, Job, [(String, String?)], Double) -> Void,
-                         skip: (Job) -> Bool = { _ in false }) throws {
+                         skip: (Int, Job) throws -> Bool = { _, _ in false }) throws {
         var ahead: PendingBatch?
         defer {
             // A job prepared for a run that stopped early: throw its files away.
@@ -236,7 +248,7 @@ public final class Indexer {
             let prepared = (ahead ?? prepare(job)).wait()
             ahead = index + 1 < jobs.count ? prepare(jobs[index + 1]) : nil
             defer { try? FileManager.default.removeItem(at: prepared.folder) }
-            guard !skip(job) else { continue }
+            guard try !skip(index, job) else { continue }
             // The helper's and the CLI's main thread has no run loop to drain what Foundation autoreleases while a job
             // commits: without a pool per job it all stayed until the process exited (~30 KB a text chunk).
             let modelWasRunning = worker != nil

@@ -2,6 +2,7 @@
 //! download turned into one line, a progress and a caveat for results (the Mac app's AppModel and EngineStatus).
 
 use serde_json::{json, Value};
+use std::path::Path;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Activity {
@@ -36,6 +37,17 @@ pub struct Status {
     pub paused: bool,
     /// Outside the set hours (Settings → Folders): when they begin ("01:00").
     pub held_until: Option<String>,
+    /// The long file currently being read in the continuation pass.
+    pub long_file: Option<LongFileProgress>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LongFileProgress {
+    pub file_id: i64,
+    pub path: String,
+    pub kind: String,
+    pub done: u64,
+    pub total: u64,
 }
 
 impl Status {
@@ -52,11 +64,18 @@ impl Status {
             self.unfinished = count("unfinished");
         }
         match event["event"].as_str().unwrap_or_default() {
-            "sync" if count("new") > 0 => self.activity = Activity::Indexing { done: 0, total: count("new") },
+            "sync" if count("new") > 0 => {
+                self.activity = Activity::Indexing { done: 0, total: count("new") };
+                self.long_file = None;
+            }
             // A sync after a failure: the helper works again.
-            "sync" if matches!(self.activity, Activity::Failed(_)) => self.activity = Activity::Idle,
+            "sync" if matches!(self.activity, Activity::Failed(_)) => {
+                self.activity = Activity::Idle;
+                self.long_file = None;
+            }
             "file" => {
                 self.activity = Activity::Indexing { done: count("done"), total: count("total") };
+                self.long_file = None;
                 // The counts come with a sync; each file read since leaves "waiting".
                 self.pending = self.pending.saturating_sub(1);
                 if matches!(event["state"].as_str(), Some("done" | "partial")) {
@@ -64,9 +83,25 @@ impl Status {
                 }
             }
             "rest" => {
-                self.activity = Activity::Finishing { done: count("done"), total: count("total"), files: count("files") }
+                self.activity = Activity::Finishing { done: count("done"), total: count("total"), files: count("files") };
+                let state = event["state"].as_str().unwrap_or_default();
+                let clears = matches!(state, "done" | "skipped");
+                self.long_file = if clears {
+                    None
+                } else {
+                    event["path"].as_str().map(|path| LongFileProgress {
+                        file_id: event["file"].as_i64().unwrap_or(0),
+                        path: path.to_string(),
+                        kind: event["kind"].as_str().unwrap_or_default().to_string(),
+                        done: count("done"),
+                        total: count("total"),
+                    })
+                };
             }
-            "idle" | "waiting" => self.activity = Activity::Idle,
+            "idle" | "waiting" => {
+                self.activity = Activity::Idle;
+                self.long_file = None;
+            }
             "missing" => {
                 let paths = |key: &str| -> Vec<String> {
                     event[key].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect()
@@ -74,12 +109,16 @@ impl Status {
                 self.missing = paths("folders");
                 self.unreadable = paths("unreadable");
             }
-            "error" if event["fatal"] == true => self.activity = Activity::Failed("Indexing stopped".into()),
+            "error" if event["fatal"] == true => {
+                self.activity = Activity::Failed("Indexing stopped".into());
+                self.long_file = None;
+            }
             // The helper is gone: whatever it was doing is over.
             "exit" | "ended" => {
                 if matches!(self.activity, Activity::Starting | Activity::Indexing { .. } | Activity::Finishing { .. }) {
                     self.activity = Activity::Idle;
                 }
+                self.long_file = None;
             }
             _ => {}
         }
@@ -105,8 +144,21 @@ impl Status {
             Activity::Starting if !self.paused && self.held_until.is_none() => "Starting…".into(),
             Activity::Indexing { done, total } => format!("Indexing {}% · {} of {}", percent(done, total), number(done), number(total)),
             Activity::Finishing { done, total, files } => {
-                let which = if files > 0 { format!("{} long {}", number(files), plural(files, "file", "files")) } else { "long files".into() };
-                format!("Reading the rest of {which} · {}%", percent(done, total))
+                if let Some(long_file) = &self.long_file {
+                    let name = Path::new(&long_file.path)
+                        .file_name()
+                        .map(|part| part.to_string_lossy().into_owned())
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| long_file.path.clone());
+                    format!("Reading long file “{name}” · {}%", percent(done, total))
+                } else {
+                    let which = if files > 0 {
+                        format!("{} long {}", number(files), plural(files, "file", "files"))
+                    } else {
+                        "long files".into()
+                    };
+                    format!("Reading the rest of {which} · {}%", percent(done, total))
+                }
             }
             _ if self.pending > 0 => {
                 let waiting = format!("{} {} waiting", number(self.pending), plural(self.pending, "file", "files"));
@@ -197,6 +249,13 @@ impl Status {
             "measuring": self.measuring,
             "paused": self.paused,
             "heldUntil": self.held_until,
+            "longFile": self.long_file.as_ref().map(|long_file| json!({
+                "fileId": long_file.file_id,
+                "path": long_file.path,
+                "kind": long_file.kind,
+                "done": long_file.done,
+                "total": long_file.total,
+            })),
             "badge": self.badge(model),
             "busy": self.busy(model),
             "activity": match self.activity {
@@ -269,8 +328,13 @@ mod tests {
         assert_eq!(status.caveat(&ready).as_deref(), Some("Still indexing (42%): some files aren't in yet"));
         status.apply(&json!({"event": "file", "done": 1, "total": 1, "code": true}));
         assert_eq!(status.line(true, &ready), "Indexing 42% · 129 of 306");
-        status.apply(&json!({"event": "rest", "done": 40, "total": 100, "files": 3}));
-        assert_eq!(status.line(true, &ready), "Reading the rest of 3 long files · 40%");
+        status.apply(&json!({"event": "rest", "done": 40, "total": 100, "files": 3, "file": 9, "path": "/docs/Team notes 2026.md",
+                             "kind": "doc", "state": "partial"}));
+        assert_eq!(status.line(true, &ready), "Reading long file “Team notes 2026.md” · 40%");
+        assert_eq!(status.snapshot(true, &ready)["longFile"]["fileId"], 9);
+        status.apply(&json!({"event": "rest", "done": 70, "total": 100, "files": 2, "file": 9, "path": "/docs/Team notes 2026.md",
+                             "kind": "doc", "state": "skipped"}));
+        assert!(status.snapshot(true, &ready)["longFile"].is_null());
         status.apply(&json!({"event": "idle", "files": 1306, "searchable": 1306, "pending": 0, "unfinished": 0}));
         assert_eq!(status.line(true, &ready), "1,306 files indexed");
         assert_eq!(status.progress(&ready), None);
